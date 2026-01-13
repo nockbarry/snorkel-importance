@@ -80,6 +80,12 @@ class LargeScaleAnalysis:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True, parents=True)
         
+        # Create index lookup for fast label -> position conversion
+        if self.pandas_index is not None:
+            self.index_to_position = {label: pos for pos, label in enumerate(self.pandas_index)}
+        else:
+            self.index_to_position = {}
+        
         # Initialize calculator
         self.calc = SnorkelIndicatorImportance(
             indicator_matrix=indicator_matrix,
@@ -94,6 +100,41 @@ class LargeScaleAnalysis:
         print(f"Output: {self.output_dir}")
         print("=" * 80)
         print()
+    
+    def convert_labels_to_positions(self, labels: List) -> List[int]:
+        """
+        Convert pandas index labels to positional indices.
+        
+        Parameters:
+        -----------
+        labels : list
+            List of pandas index values (e.g., [3742123, 4526073])
+        
+        Returns:
+        --------
+        list of int : Positional indices
+        """
+        if not self.index_to_position:
+            # No pandas index provided, assume labels are already positions
+            return labels
+        
+        positions = []
+        not_found = []
+        
+        for label in labels:
+            if label in self.index_to_position:
+                positions.append(self.index_to_position[label])
+            else:
+                not_found.append(label)
+        
+        if not_found:
+            print(f"⚠️  Warning: {len(not_found)} labels not found in index:")
+            for label in not_found[:10]:
+                print(f"    {label}")
+            if len(not_found) > 10:
+                print(f"    ... and {len(not_found) - 10} more")
+        
+        return positions
     
     def get_row_label(self, row_idx: int) -> str:
         """Get label for a row (uses pandas index if available)."""
@@ -318,36 +359,54 @@ class LargeScaleAnalysis:
     
     def run_full_analysis(
         self,
-        focus_rows: Optional[List[int]] = None,
+        focus_rows: Optional[List] = None,
+        focus_rows_are_labels: bool = True,
         viz_sample_size: int = 5000,
         sampling_method: str = 'clustering',
-        diversity_sample_size: int = 5000
+        diversity_sample_size: int = 5000,
+        create_focus_visualizations: bool = True,
+        create_investigator_reports: bool = True
     ) -> dict:
         """
         Run complete analysis optimized for large datasets.
         
         Parameters:
         -----------
-        focus_rows : list of int, optional
-            Specific row indices for detailed analysis
+        focus_rows : list, optional
+            Row identifiers (pandas index values or positions)
+        focus_rows_are_labels : bool, default=True
+            If True, focus_rows are pandas index values (e.g., [3742123, 4526073])
+            If False, focus_rows are positional indices (e.g., [0, 1, 2])
         viz_sample_size : int
-            Sample size for visualizations (larger = better structure)
+            Sample size for global visualizations
         sampling_method : str
             'clustering', 'stratified', or 'random'
         diversity_sample_size : int
             Sample size for diversity analysis
+        create_focus_visualizations : bool, default=True
+            Whether to create 4 visualizations per focus row (can be slow for 3000 rows)
+        create_investigator_reports : bool, default=True
+            Whether to create detailed HTML reports for investigators
         
         Returns:
         --------
         dict : Complete results
         """
+        # Convert labels to positions if needed
+        if focus_rows and focus_rows_are_labels:
+            print("\nConverting pandas index labels to positions...")
+            focus_row_positions = self.convert_labels_to_positions(focus_rows)
+            print(f"✓ Converted {len(focus_row_positions)}/{len(focus_rows)} labels to positions")
+            focus_rows = focus_row_positions
+        
         results = {
             'metadata': {
                 'timestamp': datetime.now().isoformat(),
                 'n_samples': self.indicator_matrix.shape[0],
                 'n_indicators': self.indicator_matrix.shape[1],
                 'viz_sample_size': viz_sample_size,
-                'sampling_method': sampling_method
+                'sampling_method': sampling_method,
+                'n_focus_rows': len(focus_rows) if focus_rows else 0
             }
         }
         
@@ -411,16 +470,34 @@ class LargeScaleAnalysis:
             print(f"STEP 4: Detailed Analysis of {len(focus_rows)} Focus Rows")
             print("=" * 80)
             
+            if len(focus_rows) > 100:
+                print(f"⚠️  Large number of focus rows ({len(focus_rows)})")
+                if create_focus_visualizations:
+                    print(f"   This will create {len(focus_rows) * 4:,} visualizations")
+                    print(f"   Consider setting create_focus_visualizations=False for faster processing")
+            
             focus_results = []
-            for row_idx in focus_rows:
+            for i, row_idx in enumerate(focus_rows):
+                if i % 100 == 0:
+                    print(f"  Progress: {i}/{len(focus_rows)} rows analyzed...")
+                
                 if row_idx < len(self.indicator_matrix):
-                    focus_analysis = self.analyze_focus_row(row_idx, create_visualizations=True)
+                    focus_analysis = self.analyze_focus_row(
+                        row_idx,
+                        create_visualizations=create_focus_visualizations
+                    )
                     focus_results.append(focus_analysis)
                 else:
                     print(f"  Warning: Row {row_idx} out of bounds, skipping")
             
             results['focus_analysis'] = focus_results
             print(f"\n✓ Completed detailed analysis of {len(focus_results)} focus rows")
+            
+            # Create investigator reports
+            if create_investigator_reports:
+                print("\n  Creating investigator reports...")
+                self._create_investigator_reports(focus_results, results)
+                print(f"  ✓ Created investigator reports")
         
         # STEP 5: Global Visualizations
         print("\n" + "=" * 80)
@@ -552,12 +629,14 @@ class LargeScaleAnalysis:
         if focus_rows and 'focus_analysis' in results:
             lines.append("FOCUS ROWS SUMMARY")
             lines.append("-" * 80)
-            for focus in results['focus_analysis']:
+            for focus in results['focus_analysis'][:10]:
                 lines.append(f"\nRow: {focus['row_label']}")
                 lines.append(f"  Outliers: {focus['n_outliers']}")
                 lines.append(f"  Top 5 indicators:")
                 for ind in focus['top_20_indicators'][:5]:
                     lines.append(f"    - {ind['name']}: {ind['score']:.4f}")
+            if len(results['focus_analysis']) > 10:
+                lines.append(f"\n... and {len(results['focus_analysis']) - 10} more focus rows")
         
         lines.append("")
         lines.append("=" * 80)
@@ -566,6 +645,317 @@ class LargeScaleAnalysis:
             f.write('\n'.join(lines))
         
         print(f"✓ Saved: report.txt")
+    
+    def _create_investigator_reports(self, focus_results, global_results):
+        """
+        Create detailed HTML reports for investigators.
+        
+        Creates:
+        1. Individual HTML report for each focus row
+        2. Master summary table of all focus rows
+        3. CSV export of key metrics
+        """
+        reports_dir = self.output_dir / "investigator_reports"
+        reports_dir.mkdir(exist_ok=True)
+        
+        # Create master summary table
+        self._create_master_summary(focus_results, reports_dir)
+        
+        # Create individual event reports
+        for focus in focus_results:
+            self._create_event_report(focus, reports_dir)
+        
+        # Create CSV export
+        self._create_csv_export(focus_results, reports_dir)
+    
+    def _create_master_summary(self, focus_results, reports_dir):
+        """Create master HTML summary of all focus rows."""
+        html = []
+        html.append('<!DOCTYPE html>')
+        html.append('<html><head>')
+        html.append('<meta charset="UTF-8">')
+        html.append('<title>Investigation Summary - All Events</title>')
+        html.append('<style>')
+        html.append('''
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1400px; margin: 0 auto; background: white; padding: 30px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
+        h2 { color: #34495e; margin-top: 30px; }
+        table { border-collapse: collapse; width: 100%; margin: 20px 0; font-size: 14px; }
+        th { background: #3498db; color: white; padding: 12px; text-align: left; position: sticky; top: 0; }
+        td { padding: 10px; border-bottom: 1px solid #ddd; }
+        tr:hover { background: #f8f9fa; }
+        .outlier-high { background: #ffebee; color: #c62828; font-weight: bold; }
+        .outlier-medium { background: #fff3e0; color: #e65100; }
+        .outlier-low { background: #e8f5e9; color: #2e7d32; }
+        .score-pos { color: #27ae60; }
+        .score-neg { color: #e74c3c; }
+        .event-link { color: #3498db; text-decoration: none; font-weight: 600; }
+        .event-link:hover { text-decoration: underline; }
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin: 20px 0; }
+        .stat-card { background: #ecf0f1; padding: 20px; border-radius: 8px; text-align: center; }
+        .stat-value { font-size: 32px; font-weight: bold; color: #2c3e50; }
+        .stat-label { color: #7f8c8d; margin-top: 5px; }
+        ''')
+        html.append('</style></head><body>')
+        html.append('<div class="container">')
+        html.append(f'<h1>Investigation Summary - All Events ({len(focus_results)} total)</h1>')
+        html.append(f'<p style="color: #7f8c8d;">Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>')
+        
+        # Statistics cards
+        html.append('<div class="stats">')
+        
+        total_outliers = sum(f['n_outliers'] for f in focus_results)
+        avg_outliers = total_outliers / len(focus_results) if focus_results else 0
+        max_outliers = max(f['n_outliers'] for f in focus_results) if focus_results else 0
+        
+        html.append(f'''
+        <div class="stat-card">
+            <div class="stat-value">{len(focus_results)}</div>
+            <div class="stat-label">Total Events</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{total_outliers}</div>
+            <div class="stat-label">Total Outliers</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{avg_outliers:.1f}</div>
+            <div class="stat-label">Avg Outliers/Event</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{max_outliers}</div>
+            <div class="stat-label">Max Outliers</div>
+        </div>
+        ''')
+        html.append('</div>')
+        
+        # Master table
+        html.append('<h2>All Events Summary</h2>')
+        html.append('<table>')
+        html.append('<tr>')
+        html.append('<th>Event ID</th>')
+        html.append('<th>Outliers</th>')
+        html.append('<th>Top Indicator</th>')
+        html.append('<th>Top Score</th>')
+        html.append('<th>2nd Indicator</th>')
+        html.append('<th>3rd Indicator</th>')
+        html.append('<th>Details</th>')
+        html.append('</tr>')
+        
+        for focus in sorted(focus_results, key=lambda x: x['n_outliers'], reverse=True):
+            event_id = focus['row_label']
+            n_outliers = focus['n_outliers']
+            
+            # Outlier class
+            if n_outliers > avg_outliers + 5:
+                outlier_class = 'outlier-high'
+            elif n_outliers > avg_outliers:
+                outlier_class = 'outlier-medium'
+            else:
+                outlier_class = 'outlier-low'
+            
+            top_indicators = focus['top_20_indicators'][:3]
+            
+            html.append('<tr>')
+            html.append(f'<td><strong>{event_id}</strong></td>')
+            html.append(f'<td class="{outlier_class}">{n_outliers}</td>')
+            
+            if top_indicators:
+                top1 = top_indicators[0]
+                score_class = 'score-pos' if top1['score'] > 0 else 'score-neg'
+                html.append(f'<td>{top1["name"][:40]}</td>')
+                html.append(f'<td class="{score_class}">{top1["score"]:.3f}</td>')
+                
+                if len(top_indicators) > 1:
+                    html.append(f'<td>{top_indicators[1]["name"][:30]}</td>')
+                else:
+                    html.append('<td>-</td>')
+                
+                if len(top_indicators) > 2:
+                    html.append(f'<td>{top_indicators[2]["name"][:30]}</td>')
+                else:
+                    html.append('<td>-</td>')
+            else:
+                html.append('<td colspan="4">-</td>')
+            
+            html.append(f'<td><a class="event-link" href="event_{event_id}.html">View Details →</a></td>')
+            html.append('</tr>')
+        
+        html.append('</table>')
+        html.append('</div></body></html>')
+        
+        with open(reports_dir / "index.html", 'w') as f:
+            f.write('\n'.join(html))
+    
+    def _create_event_report(self, focus, reports_dir):
+        """Create detailed HTML report for a single event/row."""
+        event_id = focus['row_label']
+        
+        html = []
+        html.append('<!DOCTYPE html>')
+        html.append('<html><head>')
+        html.append('<meta charset="UTF-8">')
+        html.append(f'<title>Event {event_id} - Investigation Report</title>')
+        html.append('<style>')
+        html.append('''
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
+        h2 { color: #34495e; margin-top: 30px; background: #ecf0f1; padding: 10px; border-left: 4px solid #3498db; }
+        table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+        th { background: #34495e; color: white; padding: 12px; text-align: left; }
+        td { padding: 10px; border-bottom: 1px solid #ddd; }
+        tr:hover { background: #f8f9fa; }
+        .score-pos { color: #27ae60; font-weight: bold; }
+        .score-neg { color: #e74c3c; font-weight: bold; }
+        .alert { background: #fff3cd; border: 1px solid #ffc107; padding: 15px; border-radius: 5px; margin: 20px 0; }
+        .back-link { display: inline-block; margin-bottom: 20px; color: #3498db; text-decoration: none; }
+        .back-link:hover { text-decoration: underline; }
+        .metric { background: #e8f4f8; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        .viz-gallery { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin: 20px 0; }
+        .viz-item img { width: 100%; border: 1px solid #ddd; border-radius: 5px; }
+        .viz-item p { text-align: center; font-weight: bold; color: #34495e; margin-top: 10px; }
+        ''')
+        html.append('</style></head><body>')
+        html.append('<div class="container">')
+        html.append('<a class="back-link" href="index.html">← Back to Summary</a>')
+        html.append(f'<h1>Event {event_id} - Detailed Investigation Report</h1>')
+        
+        # Key metrics
+        html.append('<div class="metric">')
+        html.append(f'<strong>Outlier Indicators:</strong> {focus["n_outliers"]} detected')
+        if focus["n_outliers"] > 5:
+            html.append(' <span style="color: #e74c3c;">⚠️ HIGH</span>')
+        html.append('</div>')
+        
+        # Outliers section
+        if focus['outlier_indicators']:
+            html.append('<div class="alert">')
+            html.append('<strong>⚠️ Unusual Indicator Behavior Detected</strong>')
+            html.append(f'<p>{focus["n_outliers"]} indicators showed unusual values for this event:</p>')
+            html.append('<ul>')
+            for outlier in focus['outlier_indicators'][:10]:
+                html.append(f'<li><strong>{outlier["name"]}</strong>: {outlier["value"]:.3f}</li>')
+            html.append('</ul>')
+            html.append('</div>')
+        
+        # Top 20 indicators table
+        html.append('<h2>Top 20 Most Important Indicators for This Event</h2>')
+        html.append('<table>')
+        html.append('<tr><th>Rank</th><th>Indicator Name</th><th>Importance Score</th></tr>')
+        
+        for i, indicator in enumerate(focus['top_20_indicators'], 1):
+            score = indicator['score']
+            score_class = 'score-pos' if score > 0 else 'score-neg'
+            html.append(f'<tr>')
+            html.append(f'<td>{i}</td>')
+            html.append(f'<td>{indicator["name"]}</td>')
+            html.append(f'<td class="{score_class}">{score:.4f}</td>')
+            html.append(f'</tr>')
+        
+        html.append('</table>')
+        
+        # Deviation importance
+        html.append('<h2>Top 10 Deviation Importance (Unusual Patterns)</h2>')
+        html.append('<p>These indicators behaved most differently from typical patterns:</p>')
+        html.append('<table>')
+        html.append('<tr><th>Rank</th><th>Indicator Name</th><th>Deviation Score</th></tr>')
+        
+        for i, (name, score) in enumerate(focus['top_10_deviation'], 1):
+            score_class = 'score-pos' if score > 0 else 'score-neg'
+            html.append(f'<tr>')
+            html.append(f'<td>{i}</td>')
+            html.append(f'<td>{name}</td>')
+            html.append(f'<td class="{score_class}">{score:.4f}</td>')
+            html.append(f'</tr>')
+        
+        html.append('</table>')
+        
+        # Similar events
+        html.append('<h2>10 Most Similar Events</h2>')
+        html.append('<p>Events with similar indicator patterns:</p>')
+        html.append('<table>')
+        html.append('<tr><th>Rank</th><th>Event ID</th><th>Similarity Score</th></tr>')
+        
+        for i, similar in enumerate(focus['top_10_similar'], 1):
+            html.append(f'<tr>')
+            html.append(f'<td>{i}</td>')
+            html.append(f'<td><a href="event_{similar["label"]}.html">{similar["label"]}</a></td>')
+            html.append(f'<td>{similar["score"]:.4f}</td>')
+            html.append(f'</tr>')
+        
+        html.append('</table>')
+        
+        # Visualizations (if they exist)
+        focus_viz_dir = self.output_dir / "focus_rows"
+        if focus_viz_dir.exists():
+            viz_files = [
+                (f"{event_id}_top20.png", "Top 20 Indicators"),
+                (f"{event_id}_radar.png", "Indicator Profile (Radar)"),
+                (f"{event_id}_comparison.png", "Comparison with Similar Events"),
+                (f"{event_id}_heatmap.png", "Indicator Values Heatmap")
+            ]
+            
+            existing_viz = [(f, title) for f, title in viz_files if (focus_viz_dir / f).exists()]
+            
+            if existing_viz:
+                html.append('<h2>Visualizations</h2>')
+                html.append('<div class="viz-gallery">')
+                for filename, title in existing_viz:
+                    html.append('<div class="viz-item">')
+                    html.append(f'<img src="../focus_rows/{filename}" alt="{title}">')
+                    html.append(f'<p>{title}</p>')
+                    html.append('</div>')
+                html.append('</div>')
+        
+        html.append('<br><a class="back-link" href="index.html">← Back to Summary</a>')
+        html.append('</div></body></html>')
+        
+        filename = f"event_{event_id}.html".replace('/', '_')
+        with open(reports_dir / filename, 'w') as f:
+            f.write('\n'.join(html))
+    
+    def _create_csv_export(self, focus_results, reports_dir):
+        """Export focus results to CSV for further analysis."""
+        import csv
+        
+        # Main summary CSV
+        with open(reports_dir / "events_summary.csv", 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'Event_ID', 'Outlier_Count',
+                'Top1_Indicator', 'Top1_Score',
+                'Top2_Indicator', 'Top2_Score',
+                'Top3_Indicator', 'Top3_Score'
+            ])
+            
+            for focus in focus_results:
+                row = [focus['row_label'], focus['n_outliers']]
+                
+                for i in range(3):
+                    if i < len(focus['top_20_indicators']):
+                        ind = focus['top_20_indicators'][i]
+                        row.extend([ind['name'], ind['score']])
+                    else:
+                        row.extend(['', ''])
+                
+                writer.writerow(row)
+        
+        # Detailed indicators CSV
+        with open(reports_dir / "events_detailed.csv", 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Event_ID', 'Rank', 'Indicator_Name', 'Importance_Score'])
+            
+            for focus in focus_results:
+                for i, ind in enumerate(focus['top_20_indicators'], 1):
+                    writer.writerow([
+                        focus['row_label'],
+                        i,
+                        ind['name'],
+                        ind['score']
+                    ])
+        
+        print(f"    ✓ CSV exports: events_summary.csv, events_detailed.csv")
 
 
 # Simple function interface
@@ -573,16 +963,49 @@ def analyze_large_dataset(
     indicator_matrix: Union[np.ndarray, pd.DataFrame],
     snorkel_weights: np.ndarray,
     indicator_names: List[str],
-    focus_rows: Optional[List[int]] = None,
+    focus_rows: Optional[List] = None,
+    focus_rows_are_labels: bool = True,
     pandas_index: Optional[np.ndarray] = None,
     output_dir: str = "./large_scale_analysis",
     viz_sample_size: int = 5000,
-    sampling_method: str = 'clustering'
+    sampling_method: str = 'clustering',
+    create_focus_visualizations: bool = True,
+    create_investigator_reports: bool = True
 ) -> dict:
     """
     Analyze large dataset with focus on specific rows.
     
     Simple function interface for quick analysis.
+    
+    Parameters:
+    -----------
+    indicator_matrix : np.ndarray or pd.DataFrame
+        Matrix of indicators/labeling functions
+    snorkel_weights : np.ndarray
+        Learned weights from Snorkel
+    indicator_names : list of str
+        Names of indicators
+    focus_rows : list, optional
+        Row identifiers (pandas index values or positions)
+    focus_rows_are_labels : bool, default=True
+        If True, focus_rows are pandas index values (e.g., [3742123, 4526073])
+        If False, focus_rows are positional indices (e.g., [0, 1, 2])
+    pandas_index : np.ndarray, optional
+        Original DataFrame index
+    output_dir : str
+        Output directory
+    viz_sample_size : int
+        Sample size for global visualizations
+    sampling_method : str
+        'clustering', 'stratified', or 'random'
+    create_focus_visualizations : bool, default=True
+        Create 4 visualizations per focus row (set False for 1000+ rows)
+    create_investigator_reports : bool, default=True
+        Create detailed HTML reports for investigators
+    
+    Returns:
+    --------
+    dict : Complete results
     """
     analysis = LargeScaleAnalysis(
         indicator_matrix=indicator_matrix,
@@ -594,8 +1017,11 @@ def analyze_large_dataset(
     
     return analysis.run_full_analysis(
         focus_rows=focus_rows,
+        focus_rows_are_labels=focus_rows_are_labels,
         viz_sample_size=viz_sample_size,
-        sampling_method=sampling_method
+        sampling_method=sampling_method,
+        create_focus_visualizations=create_focus_visualizations,
+        create_investigator_reports=create_investigator_reports
     )
 
 
