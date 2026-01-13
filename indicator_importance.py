@@ -760,12 +760,14 @@ class SnorkelIndicatorImportance:
     def compute_instance_diversity(
         self,
         row_indices: Optional[List[int]] = None,
-        method: str = 'hamming'
+        method: str = 'hamming',
+        sample_size: Optional[int] = None
     ) -> np.ndarray:
         """
         Compute diversity/uniqueness score for each instance.
         
         Higher scores indicate more unique instances (different from others).
+        For large datasets, uses sampling for efficiency.
         
         Parameters:
         -----------
@@ -773,6 +775,9 @@ class SnorkelIndicatorImportance:
             Indices to analyze. If None, analyzes all rows.
         method : str, default='hamming'
             Method for computing diversity
+        sample_size : int, optional
+            Number of samples to compare against (for large datasets).
+            If None, uses min(1000, n_samples)
         
         Returns:
         --------
@@ -784,13 +789,41 @@ class SnorkelIndicatorImportance:
         patterns = self.get_indicator_patterns(binarize=True)
         
         if method == 'hamming':
-            # Average Hamming distance to all other instances
+            # For efficiency, compare against a sample rather than all instances
+            if sample_size is None:
+                sample_size = min(1000, len(patterns))
+            
+            # Sample instances to compare against
+            compare_indices = np.random.choice(
+                len(patterns),
+                size=min(sample_size, len(patterns)),
+                replace=False
+            )
+            compare_patterns = patterns[compare_indices]
+            
+            # Vectorized diversity computation
             diversity_scores = np.zeros(len(row_indices))
             
-            for i, idx in enumerate(row_indices):
-                distances = np.sum(patterns != patterns[idx], axis=1) / patterns.shape[1]
-                diversity_scores[i] = np.mean(distances)
+            # Process in batches for memory efficiency
+            batch_size = 100
+            for i in range(0, len(row_indices), batch_size):
+                batch_end = min(i + batch_size, len(row_indices))
+                batch_indices = row_indices[i:batch_end]
+                batch_patterns = patterns[batch_indices]
+                
+                # Compute Hamming distances: (batch_size, n_indicators) vs (sample_size, n_indicators)
+                # Result: (batch_size, sample_size)
+                distances = np.mean(batch_patterns[:, np.newaxis, :] != compare_patterns[np.newaxis, :, :], axis=2)
+                
+                # Average distance to sampled instances
+                diversity_scores[i:batch_end] = np.mean(distances, axis=1)
             
+            return diversity_scores
+        
+        elif method == 'variance':
+            # Fast alternative: variance of indicator values
+            # Higher variance = more unique pattern
+            diversity_scores = np.var(patterns[row_indices], axis=1)
             return diversity_scores
         
         else:

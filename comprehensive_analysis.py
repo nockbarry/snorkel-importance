@@ -95,7 +95,14 @@ class ComprehensiveAnalysis:
         print(f"Output directory: {self.output_dir}")
         print()
     
-    def run_all(self, max_viz_samples: int = 100):
+    def run_all(
+        self, 
+        max_viz_samples: int = 100,
+        skip_diversity: bool = False,
+        skip_similarity: bool = False,
+        skip_viz: bool = False,
+        diversity_sample_size: int = 100
+    ):
         """
         Run complete analysis pipeline.
         
@@ -103,8 +110,25 @@ class ComprehensiveAnalysis:
         -----------
         max_viz_samples : int
             Maximum samples to include in visualizations (for performance)
+        skip_diversity : bool, default=False
+            Skip diversity analysis (slow for large datasets)
+        skip_similarity : bool, default=False
+            Skip similarity analysis (slow for large datasets)
+        skip_viz : bool, default=False
+            Skip all visualizations (for very large datasets)
+        diversity_sample_size : int, default=100
+            Sample size for diversity calculation (reduced for large datasets)
         """
         print("Starting comprehensive analysis...\n")
+        
+        # Detect large dataset
+        is_large = self.indicator_matrix.shape[0] > 100000
+        if is_large:
+            print("⚡ LARGE DATASET DETECTED")
+            print(f"   {self.indicator_matrix.shape[0]:,} samples - using optimized settings")
+            print(f"   Skipping expensive operations by default\n")
+            skip_diversity = skip_diversity or is_large
+            skip_similarity = skip_similarity or (self.indicator_matrix.shape[0] > 500000)
         
         # Step 1: Analyze weights
         self._analyze_weights()
@@ -118,14 +142,37 @@ class ComprehensiveAnalysis:
         # Step 4: Analyze top indicators
         self._analyze_top_indicators()
         
-        # Step 5: Compute diversity
-        self._analyze_diversity()
+        # Step 5: Compute diversity (OPTIONAL - can be slow)
+        if not skip_diversity:
+            self._analyze_diversity(sample_size=diversity_sample_size)
+        else:
+            print("=" * 80)
+            print("STEP 5: Instance Diversity Analysis")
+            print("=" * 80)
+            print("⚡ SKIPPED (use skip_diversity=False to enable)")
+            print("   For large datasets, this step is slow and optional\n")
+            self.results['diversity'] = {'skipped': True}
         
-        # Step 6: Similarity analysis
-        self._analyze_similarity()
+        # Step 6: Similarity analysis (OPTIONAL - can be slow)
+        if not skip_similarity:
+            self._analyze_similarity()
+        else:
+            print("=" * 80)
+            print("STEP 6: Similarity Analysis")
+            print("=" * 80)
+            print("⚡ SKIPPED (use skip_similarity=False to enable)")
+            print("   For large datasets, this step is slow and optional\n")
+            self.results['similarity_analysis'] = {'skipped': True}
         
-        # Step 7: Generate all visualizations
-        self._generate_visualizations(max_samples=max_viz_samples)
+        # Step 7: Generate visualizations (OPTIONAL)
+        if not skip_viz:
+            self._generate_visualizations(max_samples=max_viz_samples)
+        else:
+            print("=" * 80)
+            print("STEP 7: Visualizations")
+            print("=" * 80)
+            print("⚡ SKIPPED (use skip_viz=False to enable)\n")
+            self.results['visualizations'] = []
         
         # Step 8: Create summary report
         self._create_report()
@@ -139,7 +186,8 @@ class ComprehensiveAnalysis:
         print(f"\nAll results saved to: {self.output_dir}")
         print(f"  • Report: {self.sample_name}_report.txt")
         print(f"  • Data: {self.sample_name}_results.json")
-        print(f"  • Visualizations: {len(self.results['visualizations'])} PNG files")
+        if not skip_viz:
+            print(f"  • Visualizations: {len(self.results['visualizations'])} PNG files")
         
         return self.results
     
@@ -298,24 +346,25 @@ class ComprehensiveAnalysis:
             print(f"{item['rank']:<6} {item['name']:<30} {item['avg_importance']:>14.4f}  {item['weight']:>8.3f}")
         print()
     
-    def _analyze_diversity(self):
+    def _analyze_diversity(self, sample_size: int = 100):
         """Analyze instance diversity."""
         print("=" * 80)
         print("STEP 5: Instance Diversity Analysis")
         print("=" * 80)
         
-        print("Computing instance diversity scores...")
+        print(f"Computing instance diversity scores (sample_size={sample_size})...")
         
-        # Sample for diversity calculation (can be slow for large datasets)
-        sample_size = min(1000, self.indicator_matrix.shape[0])
+        # Sample for diversity calculation (much smaller for large datasets)
+        analysis_sample_size = min(sample_size, self.indicator_matrix.shape[0])
         sample_indices = np.random.choice(
             self.indicator_matrix.shape[0],
-            size=sample_size,
+            size=analysis_sample_size,
             replace=False
         )
         
         diversity_scores = self.calc.compute_instance_diversity(
-            row_indices=list(sample_indices)
+            row_indices=list(sample_indices),
+            sample_size=min(500, self.indicator_matrix.shape[0])  # Compare against max 500
         )
         
         stats = {
@@ -323,7 +372,7 @@ class ComprehensiveAnalysis:
             'std_diversity': float(np.std(diversity_scores)),
             'min_diversity': float(np.min(diversity_scores)),
             'max_diversity': float(np.max(diversity_scores)),
-            'sample_size': sample_size
+            'sample_size': analysis_sample_size
         }
         
         # Find most/least diverse samples
@@ -335,7 +384,7 @@ class ComprehensiveAnalysis:
         
         self.results['diversity'] = stats
         
-        print(f"✓ Diversity Analysis (on {sample_size:,} samples):")
+        print(f"✓ Diversity Analysis (on {analysis_sample_size:,} samples):")
         print(f"  Mean diversity: {stats['mean_diversity']:.4f}")
         print(f"  Range: [{stats['min_diversity']:.4f}, {stats['max_diversity']:.4f}]")
         print()
@@ -701,7 +750,11 @@ def run_full_analysis(
     indicator_names: list,
     output_dir: str = "./analysis_output",
     sample_name: str = "analysis",
-    max_viz_samples: int = 100
+    max_viz_samples: int = 100,
+    skip_diversity: bool = None,  # Auto-detect based on size
+    skip_similarity: bool = None,  # Auto-detect based on size
+    skip_viz: bool = False,
+    diversity_sample_size: int = 100
 ) -> dict:
     """
     Run complete indicator importance analysis.
@@ -718,13 +771,33 @@ def run_full_analysis(
         Directory to save outputs
     sample_name : str
         Name for this analysis
-    max_viz_samples : int
+    max_viz_samples : int, default=100
         Maximum samples in visualizations
+    skip_diversity : bool, optional
+        Skip diversity analysis. If None, auto-detects based on dataset size.
+    skip_similarity : bool, optional
+        Skip similarity analysis. If None, auto-detects based on dataset size.
+    skip_viz : bool, default=False
+        Skip all visualizations
+    diversity_sample_size : int, default=100
+        Sample size for diversity calculation (smaller = faster)
     
     Returns:
     --------
     dict : Complete analysis results
     """
+    # Auto-detect skipping based on size
+    n_samples = indicator_matrix.shape[0]
+    if skip_diversity is None:
+        skip_diversity = n_samples > 100000
+    if skip_similarity is None:
+        skip_similarity = n_samples > 500000
+    
+    if n_samples > 1000000:
+        print(f"⚡ VERY LARGE DATASET: {n_samples:,} samples")
+        print(f"   Automatically skipping: diversity={skip_diversity}, similarity={skip_similarity}")
+        print()
+    
     analysis = ComprehensiveAnalysis(
         indicator_matrix=indicator_matrix,
         snorkel_weights=snorkel_weights,
@@ -733,7 +806,13 @@ def run_full_analysis(
         sample_name=sample_name
     )
     
-    results = analysis.run_all(max_viz_samples=max_viz_samples)
+    results = analysis.run_all(
+        max_viz_samples=max_viz_samples,
+        skip_diversity=skip_diversity,
+        skip_similarity=skip_similarity,
+        skip_viz=skip_viz,
+        diversity_sample_size=diversity_sample_size
+    )
     
     # Print report to console
     print("\n" * 2)
