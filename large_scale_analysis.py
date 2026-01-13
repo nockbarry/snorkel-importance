@@ -158,7 +158,7 @@ class LargeScaleAnalysis:
         method : str
             'clustering' (best for structure), 'stratified', or 'random'
         include_focus : list of int, optional
-            Always include these indices
+            Always include these indices (must be positional indices, not labels!)
         
         Returns:
         --------
@@ -167,9 +167,14 @@ class LargeScaleAnalysis:
         total_samples = self.indicator_matrix.shape[0]
         n_samples = min(n_samples, total_samples)
         
-        # Always include focus rows
+        # Validate focus indices if provided
         if include_focus:
-            n_samples = max(n_samples, len(include_focus))
+            original_count = len(include_focus)
+            include_focus = [idx for idx in include_focus if 0 <= idx < total_samples]
+            if len(include_focus) < original_count:
+                print(f"  ⚠️  Warning: {original_count - len(include_focus)} focus indices out of bounds, filtered")
+            if include_focus:
+                n_samples = max(n_samples, len(include_focus))
         
         if method == 'random':
             selected = np.random.choice(total_samples, size=n_samples, replace=False)
@@ -395,8 +400,26 @@ class LargeScaleAnalysis:
         # Convert labels to positions if needed
         if focus_rows and focus_rows_are_labels:
             print("\nConverting pandas index labels to positions...")
+            print(f"  Dataset size: {len(self.indicator_matrix):,} rows")
+            print(f"  Focus rows requested: {len(focus_rows)}")
+            
+            if not self.index_to_position:
+                print("\n❌ ERROR: No pandas_index provided!")
+                print("   You must set pandas_index=df.index.values to use focus_rows_are_labels=True")
+                raise ValueError("pandas_index is required when focus_rows_are_labels=True")
+            
             focus_row_positions = self.convert_labels_to_positions(focus_rows)
+            
+            if not focus_row_positions:
+                print("\n❌ ERROR: No focus rows were successfully converted!")
+                print("   Check that your focus_rows values match your pandas_index")
+                print(f"   Pandas index range: {self.pandas_index[0]} to {self.pandas_index[-1]}")
+                print(f"   Focus rows sample: {focus_rows[:5]}")
+                raise ValueError("No focus rows could be converted from labels to positions")
+            
             print(f"✓ Converted {len(focus_row_positions)}/{len(focus_rows)} labels to positions")
+            print(f"  Position range: {min(focus_row_positions)} to {max(focus_row_positions)}")
+            
             focus_rows = focus_row_positions
         
         results = {
@@ -465,6 +488,7 @@ class LargeScaleAnalysis:
         }
         
         # STEP 4: Focus Row Analysis
+        focus_row_positions = []  # Track converted positions
         if focus_rows:
             print("\n" + "=" * 80)
             print(f"STEP 4: Detailed Analysis of {len(focus_rows)} Focus Rows")
@@ -478,7 +502,7 @@ class LargeScaleAnalysis:
             
             focus_results = []
             for i, row_idx in enumerate(focus_rows):
-                if i % 100 == 0:
+                if i % 100 == 0 and i > 0:
                     print(f"  Progress: {i}/{len(focus_rows)} rows analyzed...")
                 
                 if row_idx < len(self.indicator_matrix):
@@ -487,8 +511,9 @@ class LargeScaleAnalysis:
                         create_visualizations=create_focus_visualizations
                     )
                     focus_results.append(focus_analysis)
+                    focus_row_positions.append(row_idx)  # Track valid positions
                 else:
-                    print(f"  Warning: Row {row_idx} out of bounds, skipping")
+                    print(f"  Warning: Row {row_idx} (position) out of bounds, skipping")
             
             results['focus_analysis'] = focus_results
             print(f"\n✓ Completed detailed analysis of {len(focus_results)} focus rows")
@@ -504,7 +529,12 @@ class LargeScaleAnalysis:
         print(f"STEP 5: Creating Global Visualizations (sample={viz_sample_size:,}, method={sampling_method})")
         print("=" * 80)
         
-        viz_indices = self.smart_sample(viz_sample_size, method=sampling_method, include_focus=focus_rows)
+        # Use converted positions for sampling (not original labels!)
+        viz_indices = self.smart_sample(
+            viz_sample_size, 
+            method=sampling_method, 
+            include_focus=focus_row_positions if focus_row_positions else None
+        )
         print(f"  Selected {len(viz_indices):,} samples for visualization")
         
         self._create_global_visualizations(viz_indices, all_importance, outlier_counts, results)
