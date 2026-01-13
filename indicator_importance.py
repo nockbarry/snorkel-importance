@@ -133,6 +133,52 @@ class SnorkelIndicatorImportance:
         
         return importance
     
+    def compute_importance_scores_vectorized(
+        self,
+        row_indices: Optional[np.ndarray] = None,
+        normalize: bool = True,
+        consider_sign: bool = True
+    ) -> np.ndarray:
+        """
+        Compute importance scores for multiple rows at once (vectorized).
+        
+        This is much faster than calling compute_importance_scores in a loop.
+        
+        Parameters:
+        -----------
+        row_indices : np.ndarray, optional
+            Indices of rows to compute importance for. If None, computes for all rows.
+        normalize : bool, default=True
+            Whether to normalize scores to sum to 1 per row
+        consider_sign : bool, default=True
+            Whether to preserve the sign of indicator * weight product
+        
+        Returns:
+        --------
+        np.ndarray : Importance scores matrix of shape (n_rows, n_indicators)
+        """
+        # Select rows
+        if row_indices is None:
+            data = self.indicator_matrix
+        else:
+            data = self.indicator_matrix[row_indices]
+        
+        # Vectorized computation: element-wise multiply each row by weights
+        # Broadcasting: (n_rows, n_indicators) * (n_indicators,) -> (n_rows, n_indicators)
+        importance = data * self.weights[np.newaxis, :]
+        
+        if not consider_sign:
+            importance = np.abs(importance)
+        
+        # Normalize each row independently if requested
+        if normalize:
+            row_sums = np.sum(np.abs(importance), axis=1, keepdims=True)
+            # Avoid division by zero
+            row_sums = np.where(row_sums > 0, row_sums, 1)
+            importance = importance / row_sums
+        
+        return importance
+    
     def detect_outliers(self, row_idx: int) -> np.ndarray:
         """
         Detect which indicators are outliers for this row.
@@ -166,6 +212,53 @@ class SnorkelIndicatorImportance:
             lower_threshold = np.percentile(self.indicator_matrix, self.outlier_threshold, axis=0)
             upper_threshold = np.percentile(self.indicator_matrix, 100 - self.outlier_threshold, axis=0)
             outliers = (row_values < lower_threshold) | (row_values > upper_threshold)
+        
+        else:
+            raise ValueError(f"Unknown outlier method: {self.outlier_method}")
+        
+        return outliers
+    
+    def detect_outliers_vectorized(
+        self,
+        row_indices: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """
+        Detect outliers for multiple rows at once (vectorized).
+        
+        Parameters:
+        -----------
+        row_indices : np.ndarray, optional
+            Indices of rows to check. If None, checks all rows.
+        
+        Returns:
+        --------
+        np.ndarray : Boolean matrix of shape (n_rows, n_indicators) indicating outliers
+        """
+        # Select rows
+        if row_indices is None:
+            data = self.indicator_matrix
+        else:
+            data = self.indicator_matrix[row_indices]
+        
+        if self.outlier_method == 'iqr':
+            # IQR method: vectorized across all rows
+            lower_bound = self.q25 - self.outlier_threshold * self.iqr
+            upper_bound = self.q75 + self.outlier_threshold * self.iqr
+            # Broadcasting: (n_rows, n_indicators) compared to (n_indicators,)
+            outliers = (data < lower_bound[np.newaxis, :]) | (data > upper_bound[np.newaxis, :])
+        
+        elif self.outlier_method == 'zscore':
+            # Z-score method: vectorized
+            with np.errstate(divide='ignore', invalid='ignore'):
+                z_scores = np.abs((data - self.means[np.newaxis, :]) / self.stds[np.newaxis, :])
+                z_scores = np.nan_to_num(z_scores, nan=0.0)
+            outliers = z_scores > self.outlier_threshold
+        
+        elif self.outlier_method == 'percentile':
+            # Percentile method: vectorized
+            lower_threshold = np.percentile(self.indicator_matrix, self.outlier_threshold, axis=0)
+            upper_threshold = np.percentile(self.indicator_matrix, 100 - self.outlier_threshold, axis=0)
+            outliers = (data < lower_threshold[np.newaxis, :]) | (data > upper_threshold[np.newaxis, :])
         
         else:
             raise ValueError(f"Unknown outlier method: {self.outlier_method}")
@@ -255,14 +348,122 @@ class SnorkelIndicatorImportance:
         list of IndicatorImportance : Explanations for each row
         """
         if row_indices is None:
-            row_indices = range(self.indicator_matrix.shape[0])
+            row_indices = list(range(self.indicator_matrix.shape[0]))
         
+        # Convert to numpy array for vectorized operations
+        row_indices_array = np.array(row_indices)
+        
+        # Compute importance scores for all rows at once (VECTORIZED)
+        importance_matrix = self.compute_importance_scores_vectorized(
+            row_indices=row_indices_array,
+            normalize=normalize,
+            consider_sign=True
+        )
+        
+        # Detect outliers for all rows at once (VECTORIZED)
+        outliers_matrix = self.detect_outliers_vectorized(row_indices=row_indices_array)
+        
+        # Build results for each row
         results = []
-        for idx in row_indices:
-            result = self.get_row_importance(idx, top_k=top_k, normalize=normalize)
-            results.append(result)
+        for i, orig_idx in enumerate(row_indices):
+            importance_scores = importance_matrix[i]
+            outliers = outliers_matrix[i]
+            
+            # Get top-k indicators by absolute importance
+            top_indices = np.argsort(np.abs(importance_scores))[-top_k:][::-1]
+            top_indicators = [
+                (self.indicator_names[idx], importance_scores[idx])
+                for idx in top_indices
+            ]
+            
+            # Get outlier indicators
+            outlier_indices = np.where(outliers)[0]
+            outlier_indicators = [
+                (self.indicator_names[idx], self.indicator_matrix[orig_idx, idx])
+                for idx in outlier_indices
+            ]
+            
+            # Create dictionary of all scores
+            all_scores = {
+                name: score
+                for name, score in zip(self.indicator_names, importance_scores)
+            }
+            
+            results.append(IndicatorImportance(
+                row_index=orig_idx,
+                top_indicators=top_indicators,
+                outlier_indicators=outlier_indicators,
+                all_scores=all_scores
+            ))
         
         return results
+    
+    def get_top_k_matrix(
+        self,
+        row_indices: Optional[np.ndarray] = None,
+        top_k: int = 10,
+        normalize: bool = True
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Get top-k indicator indices and scores for multiple rows (vectorized).
+        
+        This is the most efficient way to get top indicators for many rows.
+        
+        Parameters:
+        -----------
+        row_indices : np.ndarray, optional
+            Indices of rows to analyze. If None, analyzes all rows.
+        top_k : int, default=10
+            Number of top indicators to return per row
+        normalize : bool, default=True
+            Whether to normalize importance scores
+        
+        Returns:
+        --------
+        top_k_indices : np.ndarray
+            Matrix of shape (n_rows, top_k) with indicator indices
+        top_k_scores : np.ndarray
+            Matrix of shape (n_rows, top_k) with importance scores
+        """
+        # Compute all importance scores at once
+        importance_matrix = self.compute_importance_scores_vectorized(
+            row_indices=row_indices,
+            normalize=normalize,
+            consider_sign=True
+        )
+        
+        # Use numpy's argpartition for efficient top-k selection
+        # This is faster than full sorting when k << n_indicators
+        n_indicators = importance_matrix.shape[1]
+        
+        if top_k >= n_indicators:
+            # If requesting all indicators, just sort
+            top_k_indices = np.argsort(np.abs(importance_matrix), axis=1)[:, ::-1]
+        else:
+            # Use argpartition for efficiency (O(n) vs O(n log n))
+            # Get indices of top-k by absolute value
+            partition_indices = np.argpartition(
+                np.abs(importance_matrix), 
+                -top_k, 
+                axis=1
+            )[:, -top_k:]
+            
+            # Sort these top-k indices by their actual values
+            # For each row, get the scores of the top-k indicators
+            rows = np.arange(importance_matrix.shape[0])[:, np.newaxis]
+            top_k_values = np.abs(importance_matrix[rows, partition_indices])
+            
+            # Get sorting order within the top-k
+            sort_order = np.argsort(top_k_values, axis=1)[:, ::-1]
+            
+            # Rearrange partition_indices according to sort_order
+            top_k_indices = partition_indices[rows, sort_order]
+        
+        # Extract the actual scores
+        rows = np.arange(importance_matrix.shape[0])[:, np.newaxis]
+        top_k_scores = importance_matrix[rows, top_k_indices[:, :top_k]]
+        
+        return top_k_indices[:, :top_k], top_k_scores
     
     def to_dataframe(
         self,
@@ -284,20 +485,63 @@ class SnorkelIndicatorImportance:
         pd.DataFrame : Summary with top indicators and their scores
         """
         if row_indices is None:
-            row_indices = range(min(self.indicator_matrix.shape[0], 100))
+            row_indices = list(range(min(self.indicator_matrix.shape[0], 100)))
         
+        # Use vectorized method for efficiency
+        row_indices_array = np.array(row_indices)
+        top_indices, top_scores = self.get_top_k_matrix(
+            row_indices=row_indices_array,
+            top_k=top_k,
+            normalize=True
+        )
+        
+        # Build DataFrame
         results = []
-        for idx in row_indices:
-            importance = self.get_row_importance(idx, top_k=top_k)
-            
-            row_data = {'row_index': idx}
-            for i, (name, score) in enumerate(importance.top_indicators, 1):
-                row_data[f'top_{i}_indicator'] = name
-                row_data[f'top_{i}_score'] = score
-            
+        for i, orig_idx in enumerate(row_indices):
+            row_data = {'row_index': orig_idx}
+            for j in range(top_k):
+                indicator_idx = top_indices[i, j]
+                row_data[f'top_{j+1}_indicator'] = self.indicator_names[indicator_idx]
+                row_data[f'top_{j+1}_score'] = top_scores[i, j]
             results.append(row_data)
         
         return pd.DataFrame(results)
+    
+    def get_all_importance_scores(
+        self,
+        normalize: bool = True,
+        as_dataframe: bool = False
+    ) -> Union[np.ndarray, pd.DataFrame]:
+        """
+        Get importance scores for ALL rows and ALL indicators (vectorized).
+        
+        This is the most efficient way to get the complete importance matrix.
+        
+        Parameters:
+        -----------
+        normalize : bool, default=True
+            Whether to normalize scores per row
+        as_dataframe : bool, default=False
+            If True, return as DataFrame with indicator names as columns
+        
+        Returns:
+        --------
+        np.ndarray or pd.DataFrame : 
+            Importance matrix of shape (n_samples, n_indicators)
+        """
+        importance_matrix = self.compute_importance_scores_vectorized(
+            row_indices=None,
+            normalize=normalize,
+            consider_sign=True
+        )
+        
+        if as_dataframe:
+            return pd.DataFrame(
+                importance_matrix,
+                columns=self.indicator_names
+            )
+        else:
+            return importance_matrix
     
     def plot_importance(
         self,
@@ -373,11 +617,15 @@ def example_usage():
         outlier_threshold=1.5
     )
     
+    print("=" * 80)
+    print("SINGLE ROW ANALYSIS")
+    print("=" * 80)
+    
     # Analyze a single row
     row_idx = 0
     result = importance_calc.get_row_importance(row_idx, top_k=10)
     
-    print(f"Analysis for Row {row_idx}:")
+    print(f"\nAnalysis for Row {row_idx}:")
     print("\nTop 10 Most Important Indicators:")
     for name, score in result.top_indicators:
         print(f"  {name}: {score:.4f}")
@@ -386,18 +634,116 @@ def example_usage():
     for name, value in result.outlier_indicators[:5]:  # Show first 5
         print(f"  {name}: {value:.4f}")
     
+    print("\n" + "=" * 80)
+    print("VECTORIZED BATCH ANALYSIS")
+    print("=" * 80)
+    
+    # Demonstrate vectorized computation
+    print("\n1. Get ALL importance scores at once (vectorized):")
+    import time
+    
+    start = time.time()
+    all_importance = importance_calc.get_all_importance_scores(normalize=True)
+    elapsed = time.time() - start
+    print(f"   Computed importance for ALL {n_samples} rows in {elapsed:.4f} seconds")
+    print(f"   Shape: {all_importance.shape}")
+    print(f"   Example row 0 scores: {all_importance[0, :5]}")  # First 5 scores
+    
+    # Get as DataFrame
+    print("\n2. Get as DataFrame with indicator names:")
+    importance_df = importance_calc.get_all_importance_scores(
+        normalize=True, 
+        as_dataframe=True
+    )
+    print(f"   DataFrame shape: {importance_df.shape}")
+    print(f"   Columns: {list(importance_df.columns[:5])}... (showing first 5)")
+    print("\n   First 3 rows:")
+    print(importance_df.head(3))
+    
+    # Get top-k for all rows efficiently
+    print("\n3. Get top-k indicators for all rows (vectorized):")
+    start = time.time()
+    top_indices, top_scores = importance_calc.get_top_k_matrix(top_k=10)
+    elapsed = time.time() - start
+    print(f"   Computed top-10 for ALL {n_samples} rows in {elapsed:.4f} seconds")
+    print(f"   Top indices shape: {top_indices.shape}")
+    print(f"   Top scores shape: {top_scores.shape}")
+    print(f"\n   Row 0 top indicators: {[indicator_names[i] for i in top_indices[0, :5]]}")
+    print(f"   Row 0 top scores: {top_scores[0, :5]}")
+    
+    # Vectorized outlier detection
+    print("\n4. Detect outliers for all rows (vectorized):")
+    start = time.time()
+    all_outliers = importance_calc.detect_outliers_vectorized()
+    elapsed = time.time() - start
+    outlier_counts = np.sum(all_outliers, axis=1)
+    print(f"   Detected outliers for ALL {n_samples} rows in {elapsed:.4f} seconds")
+    print(f"   Outlier matrix shape: {all_outliers.shape}")
+    print(f"   Rows with most outliers: {np.sort(outlier_counts)[-5:]}")
+    print(f"   Mean outliers per row: {np.mean(outlier_counts):.2f}")
+    
+    print("\n" + "=" * 80)
+    print("PERFORMANCE COMPARISON")
+    print("=" * 80)
+    
+    # Compare loop vs vectorized approach
+    n_test = 100
+    print(f"\nComparing performance for {n_test} rows:")
+    
+    # Method 1: Loop (old way)
+    print("\n  Method 1: Loop through rows")
+    start = time.time()
+    for idx in range(n_test):
+        _ = importance_calc.get_row_importance(idx, top_k=10)
+    loop_time = time.time() - start
+    print(f"    Time: {loop_time:.4f} seconds")
+    
+    # Method 2: Vectorized (new way)
+    print("\n  Method 2: Vectorized batch computation")
+    start = time.time()
+    _ = importance_calc.explain_predictions(row_indices=list(range(n_test)), top_k=10)
+    vectorized_time = time.time() - start
+    print(f"    Time: {vectorized_time:.4f} seconds")
+    
+    speedup = loop_time / vectorized_time
+    print(f"\n  ⚡ Speedup: {speedup:.1f}x faster with vectorization!")
+    
+    print("\n" + "=" * 80)
+    print("PRACTICAL EXAMPLES")
+    print("=" * 80)
+    
     # Analyze multiple rows
     explanations = importance_calc.explain_predictions(
         row_indices=[0, 1, 2],
         top_k=5
     )
     
-    print(f"\n\nExplanations for {len(explanations)} rows generated.")
+    print(f"\nExplanations for {len(explanations)} rows generated.")
     
-    # Create summary DataFrame
+    # Create summary DataFrame (now using vectorized method internally)
     df_summary = importance_calc.to_dataframe(row_indices=range(10), top_k=3)
     print("\nSummary DataFrame (first 5 rows):")
     print(df_summary.head())
+    
+    # Advanced: Find rows with similar importance patterns
+    print("\n" + "=" * 80)
+    print("ADVANCED: Finding Similar Rows")
+    print("=" * 80)
+    
+    from scipy.spatial.distance import cdist
+    
+    # Get all importance scores
+    all_scores = importance_calc.get_all_importance_scores(normalize=True)
+    
+    # Find rows most similar to row 0
+    target_row = all_scores[0:1, :]  # Keep 2D for cdist
+    distances = cdist(target_row, all_scores[1:], metric='cosine')[0]
+    most_similar_indices = np.argsort(distances)[:5] + 1  # +1 because we excluded row 0
+    
+    print(f"\nRows most similar to row 0 (by cosine similarity):")
+    for rank, idx in enumerate(most_similar_indices, 1):
+        similarity = 1 - distances[idx - 1]
+        print(f"  {rank}. Row {idx}: similarity = {similarity:.4f}")
     
     return importance_calc, result
 
