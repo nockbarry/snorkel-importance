@@ -1,7 +1,9 @@
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Tuple, Optional, Union
+from typing import List, Dict, Tuple, Optional, Union, Literal
 from dataclasses import dataclass
+from scipy.spatial.distance import cosine, euclidean, cityblock, hamming
+from scipy.stats import entropy
 
 
 @dataclass
@@ -543,6 +545,257 @@ class SnorkelIndicatorImportance:
         else:
             return importance_matrix
     
+    def get_indicator_patterns(
+        self,
+        binarize: bool = True,
+        threshold: float = 0.0
+    ) -> np.ndarray:
+        """
+        Get indicator firing patterns (which indicators are active).
+        
+        This focuses on WHICH indicators fired, ignoring weights entirely.
+        Useful when weights are clustered and less discriminative.
+        
+        Parameters:
+        -----------
+        binarize : bool, default=True
+            If True, returns binary pattern (fired or not)
+            If False, returns raw indicator values
+        threshold : float, default=0.0
+            For binarization, indicators > threshold are marked as 1
+        
+        Returns:
+        --------
+        np.ndarray : Pattern matrix of shape (n_samples, n_indicators)
+        """
+        if binarize:
+            return (self.indicator_matrix != threshold).astype(int)
+        else:
+            return self.indicator_matrix.copy()
+    
+    def compute_deviation_importance(
+        self,
+        row_indices: Optional[np.ndarray] = None,
+        normalize: bool = True
+    ) -> np.ndarray:
+        """
+        Compute importance based on deviation from typical patterns.
+        
+        This emphasizes indicators that fire unusually for an instance,
+        helping distinguish instances when weights are similar.
+        
+        Formula: importance = weight × (indicator_value - mean_indicator_value)
+        
+        Parameters:
+        -----------
+        row_indices : np.ndarray, optional
+            Indices to compute for. If None, computes for all rows.
+        normalize : bool, default=True
+            Whether to normalize per row
+        
+        Returns:
+        --------
+        np.ndarray : Deviation-based importance of shape (n_rows, n_indicators)
+        """
+        if row_indices is None:
+            data = self.indicator_matrix
+        else:
+            data = self.indicator_matrix[row_indices]
+        
+        # Compute deviation from mean
+        deviations = data - self.means[np.newaxis, :]
+        
+        # Weight by importance
+        deviation_importance = deviations * self.weights[np.newaxis, :]
+        
+        if normalize:
+            row_sums = np.sum(np.abs(deviation_importance), axis=1, keepdims=True)
+            row_sums = np.where(row_sums > 0, row_sums, 1)
+            deviation_importance = deviation_importance / row_sums
+        
+        return deviation_importance
+    
+    def find_similar_instances(
+        self,
+        target_idx: int,
+        top_k: int = 10,
+        method: Literal['cosine', 'euclidean', 'manhattan', 'hamming', 'pattern', 'deviation', 'combined'] = 'combined',
+        use_importance: bool = True
+    ) -> List[Tuple[int, float]]:
+        """
+        Find instances most similar to a target instance.
+        
+        When weights are clustered, use 'pattern', 'hamming', or 'combined' methods
+        for better discrimination.
+        
+        Parameters:
+        -----------
+        target_idx : int
+            Index of target instance
+        top_k : int, default=10
+            Number of similar instances to return
+        method : str, default='combined'
+            Similarity method:
+            - 'cosine': Cosine similarity on importance scores
+            - 'euclidean': Euclidean distance on importance scores
+            - 'manhattan': Manhattan distance on importance scores
+            - 'hamming': Hamming distance on indicator patterns (which fired)
+            - 'pattern': Jaccard similarity on firing patterns
+            - 'deviation': Similarity based on deviation importance
+            - 'combined': Weighted combination of multiple methods
+        use_importance : bool, default=True
+            Whether to use weighted importance or raw indicators
+        
+        Returns:
+        --------
+        list of (index, similarity) : Top-k most similar instances
+        """
+        if method == 'combined':
+            # Use weighted combination of methods
+            # This works well when weights are clustered
+            scores_importance = self._compute_similarities(target_idx, 'cosine', True)
+            scores_pattern = self._compute_similarities(target_idx, 'hamming', False)
+            scores_deviation = self._compute_deviation_similarities(target_idx)
+            
+            # Normalize all scores to [0, 1]
+            scores_importance = (scores_importance - scores_importance.min()) / (scores_importance.max() - scores_importance.min() + 1e-10)
+            scores_pattern = (scores_pattern - scores_pattern.min()) / (scores_pattern.max() - scores_pattern.min() + 1e-10)
+            scores_deviation = (scores_deviation - scores_deviation.min()) / (scores_deviation.max() - scores_deviation.min() + 1e-10)
+            
+            # Weighted combination (emphasize pattern and deviation when weights cluster)
+            combined_scores = 0.3 * scores_importance + 0.4 * scores_pattern + 0.3 * scores_deviation
+            
+            # Get top-k (excluding self)
+            combined_scores[target_idx] = -np.inf
+            top_indices = np.argsort(combined_scores)[-top_k:][::-1]
+            
+            return [(int(idx), float(combined_scores[idx])) for idx in top_indices]
+        
+        elif method == 'deviation':
+            scores = self._compute_deviation_similarities(target_idx)
+        else:
+            scores = self._compute_similarities(target_idx, method, use_importance)
+        
+        # Exclude self
+        scores[target_idx] = -np.inf if method in ['cosine', 'pattern'] else np.inf
+        
+        # Get top-k
+        if method in ['euclidean', 'manhattan', 'hamming']:
+            # Lower is better for distances
+            top_indices = np.argsort(scores)[:top_k]
+        else:
+            # Higher is better for similarities
+            top_indices = np.argsort(scores)[-top_k:][::-1]
+        
+        return [(int(idx), float(scores[idx])) for idx in top_indices]
+    
+    def _compute_similarities(
+        self,
+        target_idx: int,
+        method: str,
+        use_importance: bool
+    ) -> np.ndarray:
+        """Helper to compute similarity scores."""
+        if use_importance:
+            all_data = self.get_all_importance_scores(normalize=True)
+        else:
+            all_data = self.get_indicator_patterns(binarize=(method == 'hamming'))
+        
+        target = all_data[target_idx]
+        
+        if method == 'cosine':
+            # Compute cosine similarity for all rows
+            similarities = np.zeros(len(all_data))
+            for i in range(len(all_data)):
+                if i == target_idx:
+                    similarities[i] = 1.0
+                else:
+                    similarities[i] = 1 - cosine(target, all_data[i])
+            return similarities
+        
+        elif method == 'euclidean':
+            return np.linalg.norm(all_data - target, axis=1)
+        
+        elif method == 'manhattan':
+            return np.sum(np.abs(all_data - target), axis=1)
+        
+        elif method == 'hamming':
+            # Hamming distance on binary patterns
+            return np.sum(all_data != target, axis=1) / all_data.shape[1]
+        
+        elif method == 'pattern':
+            # Jaccard similarity: intersection / union of active indicators
+            target_active = set(np.where(target != 0)[0])
+            similarities = np.zeros(len(all_data))
+            
+            for i in range(len(all_data)):
+                row_active = set(np.where(all_data[i] != 0)[0])
+                if len(target_active) == 0 and len(row_active) == 0:
+                    similarities[i] = 1.0
+                elif len(target_active.union(row_active)) == 0:
+                    similarities[i] = 0.0
+                else:
+                    similarities[i] = len(target_active.intersection(row_active)) / len(target_active.union(row_active))
+            
+            return similarities
+        
+        else:
+            raise ValueError(f"Unknown method: {method}")
+    
+    def _compute_deviation_similarities(self, target_idx: int) -> np.ndarray:
+        """Compute similarities based on deviation importance."""
+        all_deviation = self.compute_deviation_importance(normalize=True)
+        target = all_deviation[target_idx]
+        
+        # Use cosine similarity on deviation importance
+        similarities = np.zeros(len(all_deviation))
+        for i in range(len(all_deviation)):
+            if i == target_idx:
+                similarities[i] = 1.0
+            else:
+                similarities[i] = 1 - cosine(target, all_deviation[i])
+        
+        return similarities
+    
+    def compute_instance_diversity(
+        self,
+        row_indices: Optional[List[int]] = None,
+        method: str = 'hamming'
+    ) -> np.ndarray:
+        """
+        Compute diversity/uniqueness score for each instance.
+        
+        Higher scores indicate more unique instances (different from others).
+        
+        Parameters:
+        -----------
+        row_indices : list of int, optional
+            Indices to analyze. If None, analyzes all rows.
+        method : str, default='hamming'
+            Method for computing diversity
+        
+        Returns:
+        --------
+        np.ndarray : Diversity scores, one per instance
+        """
+        if row_indices is None:
+            row_indices = list(range(self.indicator_matrix.shape[0]))
+        
+        patterns = self.get_indicator_patterns(binarize=True)
+        
+        if method == 'hamming':
+            # Average Hamming distance to all other instances
+            diversity_scores = np.zeros(len(row_indices))
+            
+            for i, idx in enumerate(row_indices):
+                distances = np.sum(patterns != patterns[idx], axis=1) / patterns.shape[1]
+                diversity_scores[i] = np.mean(distances)
+            
+            return diversity_scores
+        
+        else:
+            raise ValueError(f"Unknown method: {method}")
+    
     def plot_importance(
         self,
         row_idx: int,
@@ -586,6 +839,380 @@ class SnorkelIndicatorImportance:
         ax.set_xlabel('Importance Score')
         ax.set_title(title or f'Top {top_k} Indicator Importance for Row {row_idx}')
         ax.axvline(x=0, color='black', linestyle='-', linewidth=0.5)
+        
+        plt.tight_layout()
+        return fig
+    
+    def plot_indicator_heatmap(
+        self,
+        row_indices: Optional[List[int]] = None,
+        indicator_indices: Optional[List[int]] = None,
+        use_importance: bool = True,
+        figsize: Tuple[int, int] = (12, 8),
+        cluster_rows: bool = True,
+        cluster_cols: bool = True,
+        cmap: str = 'RdBu_r'
+    ):
+        """
+        Plot heatmap of indicator patterns or importance across instances.
+        
+        Useful for visualizing patterns when weights are similar.
+        Clustering helps identify groups of similar instances.
+        
+        Parameters:
+        -----------
+        row_indices : list of int, optional
+            Instances to include. If None, uses first 100 or all if less.
+        indicator_indices : list of int, optional
+            Indicators to include. If None, uses all.
+        use_importance : bool, default=True
+            If True, shows importance scores. If False, shows raw indicators.
+        figsize : tuple, default=(12, 8)
+            Figure size
+        cluster_rows : bool, default=True
+            Whether to cluster rows (instances)
+        cluster_cols : bool, default=True
+            Whether to cluster columns (indicators)
+        cmap : str, default='RdBu_r'
+            Colormap
+        
+        Returns:
+        --------
+        Figure : matplotlib figure
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+        except ImportError:
+            raise ImportError("matplotlib and seaborn required. Install with: pip install matplotlib seaborn")
+        
+        # Select data
+        if row_indices is None:
+            row_indices = list(range(min(100, self.indicator_matrix.shape[0])))
+        
+        if indicator_indices is None:
+            indicator_indices = list(range(self.indicator_matrix.shape[1]))
+        
+        if use_importance:
+            data = self.compute_importance_scores_vectorized(
+                row_indices=np.array(row_indices),
+                normalize=True
+            )[:, indicator_indices]
+        else:
+            data = self.indicator_matrix[np.ix_(row_indices, indicator_indices)]
+        
+        # Create labels
+        row_labels = [f"Row {i}" for i in row_indices]
+        col_labels = [self.indicator_names[i] for i in indicator_indices]
+        
+        # Plot
+        if cluster_rows or cluster_cols:
+            from scipy.cluster import hierarchy
+            from scipy.spatial.distance import pdist, squareform
+            
+            # Cluster rows
+            if cluster_rows:
+                row_linkage = hierarchy.linkage(data, method='ward')
+                row_order = hierarchy.dendrogram(row_linkage, no_plot=True)['leaves']
+                data = data[row_order, :]
+                row_labels = [row_labels[i] for i in row_order]
+            
+            # Cluster columns
+            if cluster_cols:
+                col_linkage = hierarchy.linkage(data.T, method='ward')
+                col_order = hierarchy.dendrogram(col_linkage, no_plot=True)['leaves']
+                data = data[:, col_order]
+                col_labels = [col_labels[i] for i in col_order]
+        
+        # Create heatmap
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        im = ax.imshow(data, aspect='auto', cmap=cmap, interpolation='nearest')
+        
+        # Set ticks
+        if len(row_indices) <= 50:
+            ax.set_yticks(np.arange(len(row_labels)))
+            ax.set_yticklabels(row_labels, fontsize=8)
+        
+        if len(indicator_indices) <= 30:
+            ax.set_xticks(np.arange(len(col_labels)))
+            ax.set_xticklabels(col_labels, rotation=90, fontsize=8)
+        
+        ax.set_xlabel('Indicators')
+        ax.set_ylabel('Instances')
+        ax.set_title('Indicator Pattern Heatmap' + (' (Clustered)' if cluster_rows or cluster_cols else ''))
+        
+        # Colorbar
+        plt.colorbar(im, ax=ax, label='Importance' if use_importance else 'Value')
+        
+        plt.tight_layout()
+        return fig
+    
+    def plot_similarity_matrix(
+        self,
+        row_indices: Optional[List[int]] = None,
+        method: str = 'combined',
+        figsize: Tuple[int, int] = (10, 8),
+        cluster: bool = True
+    ):
+        """
+        Plot similarity matrix between instances.
+        
+        Shows which instances are similar/different. Use 'combined' or 'pattern'
+        method when weights are clustered.
+        
+        Parameters:
+        -----------
+        row_indices : list of int, optional
+            Instances to compare. If None, uses first 100.
+        method : str, default='combined'
+            Similarity method (see find_similar_instances)
+        figsize : tuple, default=(10, 8)
+            Figure size
+        cluster : bool, default=True
+            Whether to reorder by hierarchical clustering
+        
+        Returns:
+        --------
+        Figure : matplotlib figure
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            raise ImportError("matplotlib required. Install with: pip install matplotlib")
+        
+        if row_indices is None:
+            row_indices = list(range(min(100, self.indicator_matrix.shape[0])))
+        
+        n = len(row_indices)
+        similarity_matrix = np.zeros((n, n))
+        
+        # Compute pairwise similarities
+        print(f"Computing {n}x{n} similarity matrix...")
+        for i, idx_i in enumerate(row_indices):
+            if method == 'combined':
+                # Use the combined similarity method
+                for j, idx_j in enumerate(row_indices):
+                    if i == j:
+                        similarity_matrix[i, j] = 1.0
+                    else:
+                        # Get similarity using find_similar_instances
+                        similar = self.find_similar_instances(
+                            target_idx=idx_i,
+                            top_k=n,
+                            method='combined'
+                        )
+                        # Find the score for idx_j
+                        for sim_idx, score in similar:
+                            if sim_idx == idx_j:
+                                similarity_matrix[i, j] = score
+                                break
+            else:
+                similarities = self._compute_similarities(idx_i, method, True)
+                for j, idx_j in enumerate(row_indices):
+                    similarity_matrix[i, j] = similarities[idx_j]
+        
+        # Cluster if requested
+        if cluster:
+            from scipy.cluster import hierarchy
+            linkage = hierarchy.linkage(similarity_matrix, method='ward')
+            order = hierarchy.dendrogram(linkage, no_plot=True)['leaves']
+            similarity_matrix = similarity_matrix[np.ix_(order, order)]
+            row_indices = [row_indices[i] for i in order]
+        
+        # Plot
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        im = ax.imshow(similarity_matrix, cmap='viridis', aspect='auto')
+        
+        ax.set_xlabel('Instance')
+        ax.set_ylabel('Instance')
+        ax.set_title(f'Instance Similarity Matrix ({method} method)' + 
+                    (' - Clustered' if cluster else ''))
+        
+        plt.colorbar(im, ax=ax, label='Similarity')
+        plt.tight_layout()
+        
+        return fig
+    
+    def plot_instance_comparison(
+        self,
+        row_indices: List[int],
+        top_k: int = 10,
+        figsize: Tuple[int, int] = (12, 6)
+    ):
+        """
+        Compare indicator patterns across multiple instances side-by-side.
+        
+        Useful for understanding how similar instances differ.
+        
+        Parameters:
+        -----------
+        row_indices : list of int
+            Instances to compare (max 5 recommended)
+        top_k : int, default=10
+            Number of top indicators to show per instance
+        figsize : tuple, default=(12, 6)
+            Figure size
+        
+        Returns:
+        --------
+        Figure : matplotlib figure
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            raise ImportError("matplotlib required. Install with: pip install matplotlib")
+        
+        n_instances = len(row_indices)
+        
+        fig, axes = plt.subplots(1, n_instances, figsize=figsize, sharey=True)
+        if n_instances == 1:
+            axes = [axes]
+        
+        for ax, idx in zip(axes, row_indices):
+            result = self.get_row_importance(idx, top_k=top_k)
+            
+            names = [name[:20] for name, _ in result.top_indicators]  # Truncate names
+            scores = [score for _, score in result.top_indicators]
+            colors = ['green' if s > 0 else 'red' for s in scores]
+            
+            y_pos = np.arange(len(names))
+            ax.barh(y_pos, scores, color=colors, alpha=0.7)
+            ax.set_yticks(y_pos)
+            if ax == axes[0]:
+                ax.set_yticklabels(names, fontsize=8)
+            ax.set_xlabel('Score', fontsize=8)
+            ax.set_title(f'Row {idx}', fontsize=10)
+            ax.axvline(x=0, color='black', linestyle='-', linewidth=0.5)
+        
+        fig.suptitle('Instance Comparison', fontsize=12)
+        plt.tight_layout()
+        
+        return fig
+    
+    def plot_indicator_radar(
+        self,
+        row_idx: int,
+        top_k: int = 10,
+        figsize: Tuple[int, int] = (8, 8)
+    ):
+        """
+        Plot radar/spider chart for a single instance.
+        
+        Shows the importance profile across indicators.
+        
+        Parameters:
+        -----------
+        row_idx : int
+            Instance to plot
+        top_k : int, default=10
+            Number of indicators to include
+        figsize : tuple, default=(8, 8)
+            Figure size
+        
+        Returns:
+        --------
+        Figure : matplotlib figure
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            raise ImportError("matplotlib required. Install with: pip install matplotlib")
+        
+        result = self.get_row_importance(row_idx, top_k=top_k)
+        
+        names = [name[:15] for name, _ in result.top_indicators]  # Truncate
+        scores = np.abs([score for _, score in result.top_indicators])  # Use absolute
+        
+        # Normalize to 0-1
+        if np.max(scores) > 0:
+            scores = scores / np.max(scores)
+        
+        # Create radar chart
+        angles = np.linspace(0, 2 * np.pi, len(names), endpoint=False).tolist()
+        scores = scores.tolist()
+        
+        # Close the plot
+        angles += angles[:1]
+        scores += scores[:1]
+        
+        fig, ax = plt.subplots(figsize=figsize, subplot_kw=dict(projection='polar'))
+        
+        ax.plot(angles, scores, 'o-', linewidth=2)
+        ax.fill(angles, scores, alpha=0.25)
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(names, fontsize=9)
+        ax.set_ylim(0, 1)
+        ax.set_title(f'Indicator Profile - Row {row_idx}', fontsize=12, pad=20)
+        ax.grid(True)
+        
+        plt.tight_layout()
+        return fig
+    
+    def plot_pattern_pca(
+        self,
+        row_indices: Optional[List[int]] = None,
+        use_importance: bool = True,
+        color_by: Optional[np.ndarray] = None,
+        figsize: Tuple[int, int] = (10, 8)
+    ):
+        """
+        Plot PCA projection of indicator patterns.
+        
+        Visualizes how instances cluster in pattern space. Useful when
+        weights are similar - helps see true pattern diversity.
+        
+        Parameters:
+        -----------
+        row_indices : list of int, optional
+            Instances to include. If None, uses all.
+        use_importance : bool, default=True
+            Whether to use importance scores or raw indicators
+        color_by : np.ndarray, optional
+            Values to color points by (e.g., labels, outlier counts)
+        figsize : tuple, default=(10, 8)
+            Figure size
+        
+        Returns:
+        --------
+        Figure : matplotlib figure
+        """
+        try:
+            import matplotlib.pyplot as plt
+            from sklearn.decomposition import PCA
+        except ImportError:
+            raise ImportError("matplotlib and sklearn required. Install with: pip install matplotlib scikit-learn")
+        
+        if row_indices is None:
+            row_indices = list(range(self.indicator_matrix.shape[0]))
+        
+        if use_importance:
+            data = self.compute_importance_scores_vectorized(
+                row_indices=np.array(row_indices),
+                normalize=True
+            )
+        else:
+            data = self.indicator_matrix[row_indices]
+        
+        # Apply PCA
+        pca = PCA(n_components=2)
+        projected = pca.fit_transform(data)
+        
+        # Plot
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        if color_by is not None:
+            scatter = ax.scatter(projected[:, 0], projected[:, 1], 
+                               c=color_by, cmap='viridis', alpha=0.6)
+            plt.colorbar(scatter, ax=ax)
+        else:
+            ax.scatter(projected[:, 0], projected[:, 1], alpha=0.6)
+        
+        ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)')
+        ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)')
+        ax.set_title('Instance Patterns - PCA Projection')
+        ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
         return fig
