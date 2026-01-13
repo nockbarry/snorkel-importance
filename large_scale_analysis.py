@@ -243,38 +243,66 @@ class LargeScaleAnalysis:
         
         return selected
     
-    def analyze_focus_row(
+    def analyze_focus_row_fast(
         self,
         row_idx: int,
-        create_visualizations: bool = True
+        all_importance: np.ndarray,
+        all_outliers: np.ndarray = None,
+        similarity_index=None
     ) -> dict:
         """
-        Detailed analysis of a single focus row.
+        Fast analysis of a single focus row using pre-computed data.
         
         Parameters:
         -----------
         row_idx : int
-            Row index (position in matrix, not pandas index)
-        create_visualizations : bool
-            Whether to create detailed visualizations
+            Row index (position in matrix)
+        all_importance : np.ndarray
+            Pre-computed importance scores for all rows
+        all_outliers : np.ndarray, optional
+            Pre-computed outlier matrix
+        similarity_index : optional
+            Pre-built similarity index for fast lookup
         
         Returns:
         --------
-        dict : Detailed analysis results
+        dict : Analysis results
         """
-        print(f"\n  Analyzing focus row: {self.get_row_label(row_idx)}...")
+        # Get top indicators (fast - just sorting)
+        row_importance = all_importance[row_idx]
+        top_k_indices = np.argsort(np.abs(row_importance))[-30:][::-1]
         
-        # Get importance
-        importance_result = self.calc.get_row_importance(row_idx, top_k=30)
+        top_indicators = [
+            {'name': self.indicator_names[idx], 'score': float(row_importance[idx])}
+            for idx in top_k_indices
+        ]
         
-        # Find similar instances
-        similar = self.calc.find_similar_instances(
-            target_idx=row_idx,
-            top_k=10,
-            method='combined'
-        )
+        # Get outliers (fast - already computed)
+        if all_outliers is not None:
+            is_outlier = all_outliers[row_idx]
+        else:
+            # Fallback: compute for this row only
+            is_outlier = self.calc.detect_outliers_vectorized()[row_idx]
         
-        # Deviation importance
+        outlier_indicators = [
+            {'name': self.indicator_names[i], 'value': float(self.indicator_matrix[row_idx, i])}
+            for i in range(len(is_outlier)) if is_outlier[i]
+        ]
+        
+        # Find similar instances (OPTIMIZED)
+        if similarity_index is not None:
+            # Use pre-built index (very fast)
+            similar_indices, similar_scores = similarity_index.get_similar(row_idx, k=10)
+        else:
+            # Fallback: sample-based similarity (much faster than full scan)
+            similar_indices, similar_scores = self._find_similar_fast(row_idx, all_importance)
+        
+        similar_instances = [
+            {'index': int(idx), 'label': self.get_row_label(idx), 'score': float(score)}
+            for idx, score in zip(similar_indices, similar_scores)
+        ]
+        
+        # Deviation importance (fast - single row)
         deviation_imp = self.calc.compute_deviation_importance(
             row_indices=np.array([row_idx])
         )[0]
@@ -282,19 +310,10 @@ class LargeScaleAnalysis:
         analysis = {
             'row_index': row_idx,
             'row_label': self.get_row_label(row_idx),
-            'top_20_indicators': [
-                {'name': name, 'score': float(score)}
-                for name, score in importance_result.top_indicators[:20]
-            ],
-            'n_outliers': len(importance_result.outlier_indicators),
-            'outlier_indicators': [
-                {'name': name, 'value': float(value)}
-                for name, value in importance_result.outlier_indicators
-            ],
-            'top_10_similar': [
-                {'index': int(idx), 'label': self.get_row_label(idx), 'score': float(score)}
-                for idx, score in similar
-            ],
+            'top_20_indicators': top_indicators[:20],
+            'n_outliers': len(outlier_indicators),
+            'outlier_indicators': outlier_indicators,
+            'top_10_similar': similar_instances,
             'top_10_deviation': sorted(
                 [(self.indicator_names[i], float(deviation_imp[i])) 
                  for i in range(len(deviation_imp))],
@@ -303,10 +322,84 @@ class LargeScaleAnalysis:
             )[:10]
         }
         
-        if create_visualizations:
-            self._create_focus_visualizations(row_idx, importance_result, similar)
-        
         return analysis
+    
+    def _find_similar_fast(self, row_idx: int, all_importance: np.ndarray, sample_size: int = 10000) -> tuple:
+        """
+        Fast similarity search using sampling.
+        
+        Instead of comparing to all 5M rows, compare to 10K sample.
+        Much faster with minimal quality loss.
+        """
+        n_rows = len(all_importance)
+        
+        # Sample rows to compare against (exclude target)
+        if n_rows > sample_size:
+            # Always include some nearby rows (likely similar)
+            nearby_range = 1000
+            start = max(0, row_idx - nearby_range // 2)
+            end = min(n_rows, row_idx + nearby_range // 2)
+            nearby_indices = list(range(start, end))
+            
+            # Add random sample from rest
+            other_indices = list(set(range(n_rows)) - set(nearby_indices) - {row_idx})
+            random_sample = np.random.choice(
+                other_indices,
+                size=min(sample_size - len(nearby_indices), len(other_indices)),
+                replace=False
+            )
+            
+            compare_indices = np.array(nearby_indices + list(random_sample))
+        else:
+            compare_indices = np.array([i for i in range(n_rows) if i != row_idx])
+        
+        # Compute similarities (vectorized)
+        target_imp = all_importance[row_idx]
+        compare_imp = all_importance[compare_indices]
+        
+        # Cosine similarity
+        target_norm = np.linalg.norm(target_imp)
+        compare_norms = np.linalg.norm(compare_imp, axis=1)
+        
+        with np.errstate(divide='ignore', invalid='ignore'):
+            similarities = np.dot(compare_imp, target_imp) / (compare_norms * target_norm)
+            similarities = np.nan_to_num(similarities, 0)
+        
+        # Get top 10
+        top_10_idx = np.argsort(similarities)[-10:][::-1]
+        
+        return compare_indices[top_10_idx], similarities[top_10_idx]
+    
+    def _create_focus_visualizations_fast(self, row_idx: int, focus_analysis: dict):
+        """Create single fast visualization using pre-computed data."""
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            return
+        
+        focus_dir = self.output_dir / "focus_rows"
+        focus_dir.mkdir(exist_ok=True)
+        
+        row_label = self.get_row_label(row_idx).replace('/', '_')
+        
+        # Just create top 20 bar chart (fastest)
+        top_20 = focus_analysis['top_20_indicators'][:20]
+        names = [ind['name'][:30] for ind in top_20]
+        scores = [ind['score'] for ind in top_20]
+        colors = ['green' if s > 0 else 'red' for s in scores]
+        
+        fig, ax = plt.subplots(figsize=(12, 8))
+        y_pos = np.arange(len(names))
+        ax.barh(y_pos, scores, color=colors, alpha=0.7, edgecolor='black')
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(names, fontsize=9)
+        ax.set_xlabel('Importance Score', fontsize=11)
+        ax.set_title(f'Top 20 Indicators - {row_label}', fontsize=13, fontweight='bold')
+        ax.axvline(x=0, color='black', linestyle='-', linewidth=0.8)
+        ax.grid(True, alpha=0.3, axis='x')
+        plt.tight_layout()
+        plt.savefig(focus_dir / f"{row_label}_top20.png", dpi=150, bbox_inches='tight')
+        plt.close()
     
     def _create_focus_visualizations(self, row_idx: int, importance_result, similar):
         """Create 4 detailed visualizations for a focus row."""
@@ -487,11 +580,11 @@ class LargeScaleAnalysis:
             'pct_with_outliers': float(100 * np.sum(outlier_counts > 0) / len(outlier_counts))
         }
         
-        # STEP 4: Focus Row Analysis
+        # STEP 4: Focus Row Analysis (OPTIMIZED)
         focus_row_positions = []  # Track converted positions
         if focus_rows:
             print("\n" + "=" * 80)
-            print(f"STEP 4: Detailed Analysis of {len(focus_rows)} Focus Rows")
+            print(f"STEP 4: Detailed Analysis of {len(focus_rows)} Focus Rows (OPTIMIZED)")
             print("=" * 80)
             
             if len(focus_rows) > 100:
@@ -500,23 +593,48 @@ class LargeScaleAnalysis:
                     print(f"   This will create {len(focus_rows) * 4:,} visualizations")
                     print(f"   Consider setting create_focus_visualizations=False for faster processing")
             
+            print(f"  Using fast batch processing (samples for similarity)...")
+            
+            # Pre-compute what we can reuse (already done in earlier steps)
+            # all_importance and all_outliers are already computed
+            
             focus_results = []
+            
+            # Process in batches with progress updates
+            batch_size = 100
+            import time
+            start_time = time.time()
+            
             for i, row_idx in enumerate(focus_rows):
-                if i % 100 == 0 and i > 0:
-                    print(f"  Progress: {i}/{len(focus_rows)} rows analyzed...")
+                if i > 0 and i % batch_size == 0:
+                    elapsed = time.time() - start_time
+                    rate = i / elapsed
+                    remaining = (len(focus_rows) - i) / rate if rate > 0 else 0
+                    print(f"  Progress: {i}/{len(focus_rows)} rows ({rate:.1f} rows/sec, ~{remaining/60:.1f} min remaining)")
                 
                 if row_idx < len(self.indicator_matrix):
-                    focus_analysis = self.analyze_focus_row(
+                    # Use fast version with pre-computed data
+                    focus_analysis = self.analyze_focus_row_fast(
                         row_idx,
-                        create_visualizations=create_focus_visualizations
+                        all_importance=all_importance,
+                        all_outliers=all_outliers
                     )
                     focus_results.append(focus_analysis)
                     focus_row_positions.append(row_idx)  # Track valid positions
+                    
+                    # Create visualizations separately if requested
+                    if create_focus_visualizations and i < 100:  # Limit viz to first 100 for sanity
+                        self._create_focus_visualizations_fast(row_idx, focus_analysis)
+                    elif create_focus_visualizations and i == 100:
+                        print(f"  ⚠️  Limiting visualizations to first 100 rows (creating 12K+ images is slow)")
                 else:
                     print(f"  Warning: Row {row_idx} (position) out of bounds, skipping")
             
+            elapsed = time.time() - start_time
+            print(f"\n✓ Completed detailed analysis of {len(focus_results)} focus rows in {elapsed/60:.1f} minutes")
+            print(f"  Average: {elapsed/len(focus_results):.2f} seconds per row")
+            
             results['focus_analysis'] = focus_results
-            print(f"\n✓ Completed detailed analysis of {len(focus_results)} focus rows")
             
             # Create investigator reports
             if create_investigator_reports:
